@@ -1,21 +1,33 @@
 #include <LiquidCrystal.h>
-// #include <DHT.h>
+#include <DHT.h>
 #include "wiring_private.h"
 #include "pins_arduino.h"
 
 #include <Wire.h>
 #include <DS3231.h>
+#include <dht_nonblocking.h>
 
 DS3231 clock;
-RTCDateTime dt;
+DateTime dt;
+
+int flag = 1;
+
+#define WATER_LEVEL_THRESHOLD 30 //insert appropriate value here
+#define lowThreshold 30
+#define highThreshold 50
+
+/* Uncomment according to your sensortype. */
+#define DHT_SENSOR_TYPE DHT_TYPE_11
+//#define DHT_SENSOR_TYPE DHT_TYPE_21
+//#define DHT_SENSOR_TYPE DHT_TYPE_22
+
+static const int DHT_SENSOR_PIN = 2;
+DHT_nonblocking dht_sensor( DHT_SENSOR_PIN, DHT_SENSOR_TYPE );
 
 
-#define WATER_LEVEL_THRESHOLD 30; //insert appropriate value here
-#define lowThreshold 30;
-#define highthreshold 50;
-
-
-uint8_t analog_reference = DEFAULT;
+//interrupts
+volatile const uint8_t buttonPin = 2;
+volatile const uint8_t ledPin = 5;
 
 //define Port A register pointers
 volatile unsigned char* port_a = (unsigned char*) 0x22; 
@@ -34,6 +46,29 @@ volatile unsigned char* my_ADCSRA = 0x7A;
 volatile unsigned int* my_ADC_DATA = 0x78;
 unsigned char bits_ADMUX[8] = {0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07};
 
+//RGB LED
+volatile unsigned char* port_L = (unsigned char*) 0x10B;
+volatile unsigned char* ddr_L  = (unsigned char*) 0x10A;
+volatile unsigned char* pin_L  = (unsigned char*) 0x109;
+//pointer to Timer 5
+volatile unsigned char* TCCR_5C  = (unsigned char*) 0x120;
+
+int Red = 5; // 44
+int Green = 4; // 45
+int Blue = 3; // 46
+
+int red_light_pin = 5;
+int green_light_pin = 4;
+int blue_light_pin = 3;
+
+// Output Compare Pins - Turns on Alternatve Functionality ↓
+int COM_5_B1 = 5;
+// Wave Form Generation Mode - Turns on PWM in 8 bit mode (mode 1);
+int WGM_5_1 = 1;
+
+// Output Compare Register 5 B - This is where we store the Duty Cycle
+volatile unsigned char* OCR_5B  = (unsigned char*) 0x12A;
+
 //define states
 const int disable = 0;
 const int idle = 1;
@@ -45,11 +80,14 @@ int HistoryValue = 0;
 char printBuffer[128];
 int tempPin = 0;
 
-LiquidCrystal lcd(2, 3, 4, 5, 6, 7);
+static void measure_environment( float *temperature, float *humidity );
+bool checkWaterLevel();
+
+LiquidCrystal lcd(31, 32, 33, 34, 35, 36);
 
 void disabledState(){
     // sends time for beginning of state
-  sendTime();
+//  sendTime();
     // keeps LCD blank
   lcd.clear();
   lcd.noDisplay();
@@ -61,6 +99,10 @@ void disabledState(){
 }
 
 void setup(){
+// Sets Pins as Outputs
+  *ddr_L |= 0x01 << Red;
+  *ddr_L |= 0x01 << Green;
+  *ddr_L |= 0x01 << Blue;
 
   lcd.begin(16, 2);
   
@@ -68,16 +110,26 @@ void setup(){
 
   Serial.begin(9600);
 
-    // Initialize DS3231
-  clock.begin();
+  // Initialize DS3231
+  //clock.begin();
 
-  
+  /*
     // Manual (YYYY, MM, DD, HH, II, SS
     // might be able to just comment this line out during testing
-  clock.setDateTime(2021, 12, 06, 05, 30, 00);
+  clock.setDate(2021, 12, 06, 05, 30, 00);
   
   // Send sketch compiling time to Arduino
-  clock.setDateTime(__DATE__, __TIME__); 
+  clock.setDate(__DATE__, __TIME__); */
+
+*ddr_b &= (1 << buttonPin);
+*port_b |= (1 << ledPin);
+
+*ddr_b |=  (1 << ledPin);
+
+EICRA |= (1 << ISC01);
+EICRA &= (1 << ISC00);
+
+EIMSK |= (1 << INT0);
 
   //set PB7 to OUTPUT
   *ddr_b |= 0x80;
@@ -89,65 +141,106 @@ void setup(){
 }
 
 void loop() {
-      // turn on yellow LED for disabled state
-    *port_b = 0B00000010;
-      // pin 12
-    *pin_b = 0B00100000
-  int temperature = 0;
-  int humidity = 0;
-    
-   //TODO: check button press
-  while(buttonPressed){
-    measure_environment(&temperature, &humidity);
+  //yellow = 255, 150, 0
+  RGB_color(255,150,0);
 
-    //TODO: find thresholds from serial monitoring
+  if(flag){
+    *port_b ^= (1 << ledPin);
+     flag = 0;
+  }
+  // turn on yellow LED for disabled state
+  //*port_b = 0B00000010;
+  // pin 12
+  //*pin_b = 0B00100000;
+  float temperature = 0;
+  float humidity = 0;
+  
 
-    //runningState
-    while(temperature > highThreshold && checkWaterLevel()){
+  measure_environment(&temperature, &humidity);
+
+  //TODO: find thresholds from serial monitoring
+
+  //runningState
+  while(temperature > highThreshold && checkWaterLevel()){
       //runningState()
       //set LED blue
-      *port_b = 0B00000100;
-      sendTime();
+     // *port_b = 0B00000100;
+  //    sendTime();
       measure_environment(&temperature, &humidity);
-    }
+  }
 
-    //idleState
-    if(temperature < lowThreshold){
+  //idleState
+  if(temperature < lowThreshold){
       //set LED green
-      *port_b = 0B00010000;
-      sendTime();
+      //*port_b = 0B00010000;
+//      sendTime();
       measure_environment(&temperature, &humidity);
-    }
+  }
 
-    //errorState
-    while(!checkWaterLevel()){
+  //errorState
+  while(!checkWaterLevel()){
       //set LED red
-      *port_b = 0B00001000;
-      sendTime();
+      //*port_b = 0B00001000;
+//      sendTime();
       //turn off motor
       
       measure_environment(&temperature, &humidity);
-    }
   }
 }
 
-//I DONT THINK THIS WORKS 
-bool buttonPressed(){
-  static uint8_t lastBtnState = LOW;
-  uint8_t state;
-  if(state = HIGH){
-    Serial.println("Button pressed!");
+ISR(INT0_vect){
+  *port_b ^= (1 << ledPin);
+}
+
+void RGB_color(int red_light_value, int green_light_value, int blue_light_value)
+ {
+  aWrite(red_light_pin, red_light_value);
+  aWrite(green_light_pin, green_light_value);
+  aWrite(blue_light_pin, blue_light_value);
+}
+
+void LED_color(char color) {
+  // r = Red
+  // g = Green
+  // b = Blue
+  // y = Yellow
+
+write_pL(Red, 1);
+write_pL(Green, 0);
+write_pL(Blue, 0);
+
+  switch (color) {
+
+    case 'r':
+      write_pL(Red, 1);
+      break;
+    case 'g':
+      write_pL(Green, 1);
+      break;
+    case 'b':
+      write_pL(Blue, 1);
+      break;
+    /*case 'y':      
+      write_pL(Red, 1);
+      *TCCR_5C |= (1 << COM_5_B1) | (1 << WGM_5_1);
+      *OCR_5B = 90;
+      break;*/
   }
-  if (state != lastBtnState) {
-    lastBtnState = state;
-    if (state == HIGH) {
-      
-  }
-  delay(100);
+
+}
+
+void write_pL(unsigned char pin_num, unsigned char state)
+{
+  if (state == 0){
+    *port_L &= ~(0x01 << pin_num);
+  
+  }else{
+    *port_L |= 0x01 << pin_num;
+  
   }
 }
 
-
+/*
 void sendTime(){
   dt = clock.getDateTime();
 
@@ -163,6 +256,7 @@ void sendTime(){
 
   delay(1000);
 }
+*/
     //int value = readWater(adc_id); // get adc value
 
     /*if(((HistoryValue>=value) && ((HistoryValue - value) > 10)) || ((HistoryValue<value) && ((value - HistoryValue) > 10)))
@@ -170,8 +264,9 @@ void sendTime(){
       sprintf(printBuffer,"ADC%d level is %d\n",adc_id, value);
       Serial.print(printBuffer);
       HistoryValue = value;
-    }*/
+    }
 }
+*/
 
 void adc_init()
 {
@@ -194,6 +289,7 @@ void adc_init()
 
 bool checkWaterLevel(){
   int value = adc_read(adc_id); // get adc value
+  int threshold = 0;
 
   if(((HistoryValue>=value) && ((HistoryValue - value) > 10)) || ((HistoryValue<value) && ((value - HistoryValue) > 10))) {
     HistoryValue = value;
@@ -204,9 +300,9 @@ bool checkWaterLevel(){
   (value > threshold) ? true : false;
 }
 
-static bool measure_environment( float *temperature, float *humidity )
+static void measure_environment( float *temperature, float *humidity )
 {
-  static unsigned long measurement_timestamp = millis( );
+  static unsigned int measurement_timestamp = millis( );
 
   /* Measure once every four seconds. */
   if( millis( ) - measurement_timestamp > 3000ul )
@@ -214,17 +310,14 @@ static bool measure_environment( float *temperature, float *humidity )
     if( dht_sensor.measure( temperature, humidity ) == true )
     {
       measurement_timestamp = millis( );
-      return( true );
     }
   }
 
     Serial.print("T: ");
-    Serial.print(temperature, 1);
+   // Serial.print(temperature, 1);
     Serial.print("C, H: ");
-    Serial.print(humidity, 1);
+    //Serial.print(humidity, 1);
     Serial.print("%");
-
-  return( false );
 }
 
 
@@ -258,7 +351,7 @@ void printTempHumidity(){
 void sendRTCTime(){
 
 }
-
+/*
 void analogReference(uint8_t mode)
 {
   // can't actually set the register here because the default setting
@@ -266,7 +359,7 @@ void analogReference(uint8_t mode)
   // there's something connected to AREF.
   analog_reference = mode;
 }
-
+*/
 /*
 int adc_read(uint8_t pin)
 {
@@ -356,4 +449,256 @@ unsigned int adc_read(unsigned char adc_channel_num)
   
   // return the result in the ADC data register
   return *my_ADC_DATA;
+}
+
+
+
+
+
+
+//____________________________________________________________________________________________________________________________________________________________________________________________________________
+/*
+//www.elegoo.com
+//2016.12.9
+
+/*
+  LiquidCrystal Library - Hello World
+
+ Demonstrates the use a 16x2 LCD display.  The LiquidCrystal
+ library works with all LCD displays that are compatible with the
+ Hitachi HD44780 driver. There are many of them out there, and you
+ can usually tell them by the 16-pin interface.
+
+ This sketch prints "Hello World!" to the LCD
+ and shows the time.
+
+  The circuit:
+ * LCD RS pin to digital pin 7
+ * LCD Enable pin to digital pin 8
+ * LCD D4 pin to digital pin 9
+ * LCD D5 pin to digital pin 10
+ * LCD D6 pin to digital pin 11
+ * LCD D7 pin to digital pin 12
+ * LCD R/W pin to ground
+ * LCD VSS pin to ground
+ * LCD VCC pin to 5V
+ * 10K resistor:
+ * ends to +5V and ground
+ * wiper to LCD VO pin (pin 3)
+
+ Library originally added 18 Apr 2008
+ by David A. Mellis
+ library modified 5 Jul 2009
+ by Limor Fried (http://www.ladyada.net)
+ example added 9 Jul 2009
+ by Tom Igoe
+ modified 22 Nov 2010
+ by Tom Igoe
+
+ This example code is in the public domain.
+
+ http://www.arduino.cc/en/Tutorial/LiquidCrystal
+ 
+
+// include the library code:
+#include <LiquidCrystal.h>
+
+// initialize the library with the numbers of the interface pins
+LiquidCrystal lcd(4, 5, 6, 7, 8, 9);
+
+#include <dht_nonblocking.h>
+#define DHT_SENSOR_TYPE DHT_TYPE_11
+
+static const int DHT_SENSOR_PIN = 49;
+DHT_nonblocking dht_sensor( DHT_SENSOR_PIN, DHT_SENSOR_TYPE );
+
+
+void setup() {
+  // set up the LCD's number of columns and rows:
+  lcd.begin(16, 2);
+  // Print a message to the LCD.
+  lcd.print("Hello, World!");
+  Serial.begin(9600);
+}
+
+static bool measure_environment( float *temperature, float *humidity )
+{
+  static unsigned long measurement_timestamp = millis( );
+
+  /* Measure once every four seconds.
+  if( millis( ) - measurement_timestamp > 3000ul )
+  {
+    if( dht_sensor.measure( temperature, humidity ) == true )
+    {
+      measurement_timestamp = millis( );
+      return( true );
+    }
+  }
+
+  return( false );
+}
+
+void loop() {
+  float temperature;
+  float humidity;
+
+  /* Measure temperature and humidity.  If the functions returns
+     true, then a measurement is available. 
+  if( measure_environment( &temperature, &humidity ) == true )
+  {
+    Serial.print( "T = " );
+    Serial.print( temperature, 1 );
+    Serial.print( " deg. C, H = " );
+    Serial.print( humidity, 1 );
+    Serial.println( "%" );
+    lcd.setCursor(0,0);
+    lcd.print("T = ");
+    lcd.print(temperature, 1);
+    lcd.print(" deg. C");
+    lcd.setCursor(0,1);
+    lcd.print("H = ");
+    
+    lcd.print(humidity, 1);
+    lcd.print("%");
+  }
+  // set the cursor to column 0, line 1
+  // (note: line 1 is the second row, since counting begins with 0):
+  //lcd.setCursor(0, 1);
+  // print the number of seconds since reset:
+  //lcd.print((millis()^10)*100);
+}
+*/
+
+
+//__________________________________________________________________________________________
+// Right now, PWM output only works on the pins with
+// hardware support.  These are defined in the appropriate
+// pins_*.c file.  For the rest of the pins, we default
+// to digital output.
+void aWrite(uint8_t pin, int val)
+{
+  // We need to make sure the PWM output is enabled for those pins
+  // that support it, as we turn it off when digitally reading or
+  // writing with them.  Also, make sure the pin is in output mode
+  // for consistenty with Wiring, which doesn't require a pinMode
+  // call for the analog output pins.
+  pMode(pin, OUTPUT);
+  if (val == 0)
+  {
+    dWrite(pin, LOW);
+  }
+  else if (val == 255)
+  {
+    dWrite(pin, HIGH);
+  }
+  else
+  {
+    switch(digitalPinToTimer(pin))
+    {
+      case TIMER0A:
+        // connect pwm to pin on timer 0, channel A
+        sbi(TCCR0A, COM0A1);
+        OCR0A = val; // set pwm duty
+        break;
+
+      case TIMER0B:
+        // connect pwm to pin on timer 0, channel B
+        sbi(TCCR0A, COM0B1);
+        OCR0B = val; // set pwm duty
+        break;
+
+      case TIMER1A:
+        // connect pwm to pin on timer 1, channel A
+        sbi(TCCR1A, COM1A1);
+        OCR1A = val; // set pwm duty
+        break;
+
+      case TIMER1B:
+        // connect pwm to pin on timer 1, channel B
+        sbi(TCCR1A, COM1B1);
+        OCR1B = val; // set pwm duty
+        break;
+
+      case TIMER2A:
+        // connect pwm to pin on timer 2, channel A
+        sbi(TCCR2A, COM2A1);
+        OCR2A = val; // set pwm duty
+        break;
+
+      case TIMER2B:
+        // connect pwm to pin on timer 2, channel B
+        sbi(TCCR2A, COM2B1);
+        OCR2B = val; // set pwm duty
+        break;
+
+      case NOT_ON_TIMER:
+      default:
+        if (val < 128) {
+          dWrite(pin, LOW);
+        } else {
+          dWrite(pin, HIGH);
+        }
+    }
+  }
+}
+
+
+
+void dWrite(uint8_t pin, uint8_t val)
+{
+        uint8_t timer = digitalPinToTimer(pin);
+        uint8_t bit = digitalPinToBitMask(pin);
+        uint8_t port = digitalPinToPort(pin);
+        volatile uint8_t *out;
+
+        if (port == NOT_A_PIN) return;
+
+        // If the pin that support PWM output, we need to turn it off
+        // before doing a digital write.
+        //if (timer != NOT_ON_TIMER) turnOffPWM(timer);
+
+        out = portOutputRegister(port);
+
+        uint8_t oldSREG = SREG;
+        cli();
+
+        if (val == LOW) {
+                *out &= ~bit;
+        } else {
+                *out |= bit;
+        }
+
+        SREG = oldSREG;
+}
+
+void pMode(uint8_t pin, uint8_t mode)
+{
+        uint8_t bit = digitalPinToBitMask(pin);
+        uint8_t port = digitalPinToPort(pin);
+        volatile uint8_t *reg, *out;
+
+        if (port == NOT_A_PIN) return;
+
+        // JWS: can I let the optimizer do this?
+        reg = portModeRegister(port);
+        out = portOutputRegister(port);
+
+        if (mode == INPUT) {
+                uint8_t oldSREG = SREG;
+                cli();
+                *reg &= ~bit;
+                *out &= ~bit;
+                SREG = oldSREG;
+        } else if (mode == INPUT_PULLUP) {
+                uint8_t oldSREG = SREG;
+                cli();
+                *reg &= ~bit;
+                *out |= bit;
+                SREG = oldSREG;
+        } else {
+                uint8_t oldSREG = SREG;
+                cli();
+                *reg |= bit;
+                SREG = oldSREG;
+        }
 }
